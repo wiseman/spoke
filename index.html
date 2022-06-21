@@ -1,168 +1,318 @@
 <!DOCTYPE html>
 <html>
+
 <head>
-<meta charset="utf-8">
-<title>Hub and spoke</title>
-<meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
-<link href="https://api.mapbox.com/mapbox-gl-js/v2.9.0-beta.2/mapbox-gl.css" rel="stylesheet">
-<script src="https://api.mapbox.com/mapbox-gl-js/v2.9.0-beta.2/mapbox-gl.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
-<script src="https://d3js.org/d3.v4.min.js"></script>
-<style>
-body { margin: 0; padding: 0; }
-#map { position: absolute; top: 0; bottom: 0; width: 100%; }
-</style>
+    <meta charset="utf-8">
+    <title>Hub and spoke</title>
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no">
+    <link href="css/mapbox-gl.css" rel="stylesheet">
+    <script src="js/mapbox-gl.js"></script>
+    <script src="js/turf.min.js"></script>
+    <script src="js/d3.v4.min.js"></script>
+    <script src="js/lodash.min.js"></script>
+    <script src="js/kdbush.min.js"></script>
+    <script src="js/jquery-3.6.0.min.js"
+        integrity="sha256-/xUj+3OJU5yExlq6GSYGSHk7tPXikynS7ogEvDej/m4=" crossorigin="anonymous"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'B612';
+        }
+
+        #map {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 100%;
+        }
+
+        p {
+            margin-left: 1cm;
+        }
+
+        @font-face {
+            font-family: B612;
+            src: url(fonts/B612-Regular.ttf);
+        }
+    </style>
 </head>
+
 <body>
-<div id="map"></div>
-<script>
+    <p style="position: absolute; z-index: 100">
+        If you like this, you might also like <a href="https://trailsofwind.figures.cc/">Trails of Wind</a>.
+    </p>
 
-let initLoad = true;
+    <div id="map"></div>
+    <script>
 
-mapboxgl.accessToken = 'pk.eyJ1Ijoid2lsbGlhbS1kYXZpcyIsImEiOiJja2tiYWtvbWcwMmtzMnBvajh3M2kxZGRuIn0.GeROaHKn2Gbvsg1e8buJEw';
-const map = new mapboxgl.Map({
-    container: 'map',
-    style: 'mapbox://styles/mapbox/streets-v11',
-    center: [0, 40],
-    zoom: 3,
-    projection: 'globe',
-    maxZoom: 6
-});
+        // Helps us keep track of a smoothed mouse heading.
+        class PoiTracker {
+            constructor() {
+                this.points_ = [];
+            }
 
-map.on('load', () => {
-    let airports;
+            addPoi(point) {
+                this.points_.push(point);
+                while (this.points_.length > 10) {
+                    this.points_.shift();
+                }
+            }
 
-    map.once('idle', () => {
-        d3.json("./data/airport.json", function (d) {
-            airports = d;
-            getSpoke(airports);
+            heading() {
+                if (this.points_.length < 2) {
+                    return;
+                }
+                return turf.bearing(this.points_[0], this.points_[this.points_.length - 1]);
+            }
+
+            point() {
+                if (this.points_.length === 0) {
+                    return;
+                } else {
+                    return this.points_[this.points_.length - 1];
+                }
+            }
+        }
+
+        // Helps us efficiently find nearby runways.
+        class FeatureSpatialIndex {
+            constructor(features) {
+                this.features_ = features;
+                this.index_ = new KDBush(runwayFeatures, (r) => r.geometry.coordinates[0], (r) => r.geometry.coordinates[1], 64);
+                console.log(`Added ${features.length} features to index`);
+            }
+
+            within(coords, radius_km) {
+                const deg_lat = radius_km / 111.11;
+                const deg_lon = radius_km / (111.11 * (Math.cos(coords[1] * Math.PI / 180.0) + 0.001));
+                const results = this.index_.within(coords[0], coords[1], Math.max(deg_lat, deg_lon));
+                return results.map((r) => this.features_[r]);
+            }
+        }
+
+        function headingDiff(h1, h2) { return (h2 - h1 + 540) % 360 - 180; }
+
+        // Normalizes headings to -180, 180.
+        function normalizeHeading(h) {
+            h = (h + 180) % 360 - 180;
+            if (h < -180) {
+                return normalizeHeading(h + 360);
+            } else if (h > 180) {
+                return normalizeHeading(h - 360);
+            } else {
+                return h;
+            }
+        }
+
+        let initLoad = true;
+        let runwayFeatures;
+        let spatialIndex;
+        let poiTracker = new PoiTracker();
+        // mode can be 'aligned' or 'radial'; 'aligned' is the default.
+        let mode = 'aligned';
+
+        $(document).on('keypress', (e) => {
+            if (e.key === 'a') {
+                mode = 'aligned';
+            } else if (e.key === 'r') {
+                mode = 'radial';
+            }
+            const heading = poiTracker.heading();
+            const point = poiTracker.point();
+            if (heading && point) {
+                buildRunwaysSpoke(runways, point, heading);
+            }
         });
 
-        // use mouse location
-        // map.on('mousemove', (e) => {
-        //     const newPoint = turf.point([e.lngLat.lng, e.lngLat.lat]);
-        //     buildSpoke(airports, newPoint);
-        // });
-
-        // use map center
-        map.on('move', () => {
-            getSpoke(airports);
+        mapboxgl.accessToken = 'pk.eyJ1Ijoid2lzZW1hbiIsImEiOiJHbzAtOHgwIn0.Pj1Nx77LS1-ujzRKJVOttA';
+        const map = new mapboxgl.Map({
+            container: 'map',
+            style: 'mapbox://styles/mapbox/streets-v11',
+            center: [0, 40],
+            zoom: 3,
+            projection: 'globe',
+            // maxZoom: 6
         });
-    });
-});
 
-function getSpoke(airports) {
-    const center = map.getCenter();
-    const newPoint = turf.point([center.lng, center.lat]);
-    buildSpoke(airports, newPoint);
-}
+        map.on('load', () => {
+            map.once('idle', () => {
+                // runways/csv is a copy of the global runway data used by the
+                // wonderful map at https://trailsofwind.figures.cc/
+                d3.csv("./data/runways.csv", function (d) {
+                    // Filter out runways that don't have coordinates and
+                    // headings. Then turn them into point features with a
+                    // property containing the heading.
+                    runwayFeatures = d.filter((r) => r.le_latitude_deg != "" && r.le_longitude_deg != "" && r.le_heading_degT != "")
+                        .map((r) =>
+                            turf.point(
+                                [parseFloat(r.le_longitude_deg), parseFloat(r.le_latitude_deg)],
+                                { id: r.id, heading: parseFloat(r.le_heading_degT) }));
+                    runways = turf.featureCollection(runwayFeatures);
+                    spatialIndex = new FeatureSpatialIndex(runwayFeatures);
+                });
 
-function buildSpoke(airports, point) {
-    let nearestAirports = turf.featureCollection([]);
-    let nearestAirportLines = turf.featureCollection([]);
-    let cleanedAirports = JSON.parse(JSON.stringify(airports));
+                if (/Mobi/.test(navigator.userAgent)) {
+                    // Mobile device: Use map center.
+                    map.on('move', (e) => {
+                        getRunways(runways);
+                    });
+                } else {
+                    // Desktop: Use mouse location.
+                    map.on('mousemove', (e) => {
+                        const newPoint = turf.point([e.lngLat.lng, e.lngLat.lat]);
+                        poiTracker.addPoi(newPoint);
+                        const heading = poiTracker.heading();
+                        if (heading) {
+                            buildRunwaysSpoke(runways, newPoint, heading);
+                        }
+                    });
+                }
+            });
+        });
 
-    for (let i=1;i<=10;i++) {
-        const nearest = turf.nearestPoint(point, cleanedAirports);
-        const nearestLine = turf.lineString([point.geometry.coordinates, nearest.geometry.coordinates]);
-        
-        nearestAirports.features.push(nearest);
-        nearestAirportLines.features.push(nearestLine);
-
-        const index = cleanedAirports.features.findIndex(n => n.properties.name === nearest.properties.name)
-        if (index !== -1) {
-            cleanedAirports.features.splice(index, 1);
+        function getRunways(runways) {
+            const center = map.getCenter();
+            const newPoint = turf.point([center.lng, center.lat]);
+            poiTracker.addPoi(newPoint);
+            const heading = poiTracker.heading();
+            if (heading) {
+                buildRunwaysSpoke(runways, newPoint, heading);
+            }
         }
-    }
 
-    if (initLoad) {
-        addLayers(airports, nearestAirports, nearestAirportLines);
-    } else {
-        map.getSource('newPoint').setData(nearestAirports);
-        map.getSource('newLine').setData(nearestAirportLines);
-    }
-}
+        function buildRunwaysSpoke(runways, point, heading) {
+            let nearestRunways = turf.featureCollection([]);
+            let nearestRunwayLines = turf.featureCollection([]);
 
-function addLayers(airports, nearest, route) {
-    initLoad = false;
+            let candidates = spatialIndex.within(point.geometry.coordinates, 210);
+            for (nearest of candidates) {
+                if (turf.distance(point, nearest.geometry, { unit: 'kilometers' }) >= 200) {
+                    continue;
+                }
+                // Try to keep the length of the runway line in pixels roughly
+                // constant.
+                const length = 1.5 ** (15 - map.getZoom());
+                const nearestLine = runwayLine(nearest, length);
 
-    map.addSource('points', {
-        'type': 'geojson',
-        'data': airports
-    });
-
-    map.addSource('newPoint', {
-        'type': 'geojson',
-        'data': nearest
-    });
-
-    map.addSource('newLine', {
-        'type': 'geojson',
-        'data': route
-    });
-
-    map.addLayer({
-        'id': 'routeLayer',
-        'type': 'line',
-        'source': 'newLine',
-        'layout': {
-            'line-join': 'round',
-            'line-cap': 'round'
-        },
-        'paint': {
-            'line-color': 'red',
-            'line-width': [
-                'interpolate',
-                ['linear'],
-                ['zoom'],
-                0,
-                0.5,
-                3,
-                4
-            ]
+                let runwayHeading = normalizeHeading(nearest.properties.heading);
+                heading = normalizeHeading(heading);
+                if (mode === 'aligned') {
+                    // If either the runway heading or the reciprocal heading is
+                    // close, then render it.
+                    if (Math.abs(headingDiff(heading, runwayHeading)) < 20
+                        || Math.abs(headingDiff(heading, (normalizeHeading(runwayHeading + 180)))) < 20) {
+                        nearestRunways.features.push(nearest);
+                        nearestRunwayLines.features.push(nearestLine);
+                    }
+                } else if (mode === 'radial') {
+                    heading = normalizeHeading(turf.bearing(point, nearest.geometry));
+                    if (Math.abs(headingDiff(heading, runwayHeading)) < 20
+                        || Math.abs(headingDiff(heading, (normalizeHeading(runwayHeading + 180)))) < 20) {
+                        nearestRunways.features.push(nearest);
+                        nearestRunwayLines.features.push(nearestLine);
+                    }
+                }
+            }
+            if (initLoad) {
+                addLayers(runways, nearestRunways, nearestRunwayLines);
+            } else {
+                map.getSource('newPoint').setData(nearestRunways);
+                map.getSource('newLine').setData(nearestRunwayLines);
+            }
         }
-    });
 
-    map.addLayer({
-        'id': 'globe-points',
-        'type': 'circle',
-        'source': 'points',
-        'paint': {
-            'circle-radius': [
-                'interpolate',
-                ['linear'],
-                ['zoom'],
-                0,
-                0.1,
-                3,
-                3
-            ],
-            'circle-opacity': 1,
-            'circle-blur': 0,
-            'circle-color': '#555'
+        function runwayLine(runway, length) {
+            const heading = (runway.properties.heading > 180) ? runway.properties.heading - 360 : runway.properties.heading;
+            const line = turf.lineString(
+                [
+                    turf.destination(runway.geometry.coordinates, length / 2, heading + 180, { units: 'kilometers' }).geometry.coordinates,
+                    turf.destination(runway.geometry.coordinates, length / 2, heading, { units: 'kilometers' }).geometry.coordinates
+                ]);
+            return line;
         }
-    });
 
-    map.addLayer({
-        'id': 'globe-newPoint',
-        'type': 'circle',
-        'source': 'newPoint',
-        'paint': {
-            'circle-radius': [
-                'interpolate',
-                ['linear'],
-                ['zoom'],
-                0,
-                0.25,
-                3,
-                4
-            ],
-            'circle-opacity': 1,
-            'circle-blur': 0,
-            'circle-color': 'red'
+        function addLayers(airports, nearest, route) {
+            initLoad = false;
+
+            map.addSource('points', {
+                'type': 'geojson',
+                'data': airports
+            });
+
+            map.addSource('newPoint', {
+                'type': 'geojson',
+                'data': nearest
+            });
+
+            map.addSource('newLine', {
+                'type': 'geojson',
+                'data': route
+            });
+
+            map.addLayer({
+                'id': 'routeLayer',
+                'type': 'line',
+                'source': 'newLine',
+                'layout': {
+                    'line-join': 'round',
+                    'line-cap': 'round'
+                },
+                'paint': {
+                    'line-color': 'red',
+                    'line-width': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        0,
+                        0.5,
+                        3,
+                        4
+                    ]
+                }
+            });
+
+            map.addLayer({
+                'id': 'globe-points',
+                'type': 'circle',
+                'source': 'points',
+                'paint': {
+                    'circle-radius': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        0,
+                        0.1,
+                        3,
+                        3
+                    ],
+                    'circle-opacity': 1,
+                    'circle-blur': 0,
+                    'circle-color': '#555'
+                }
+            });
+
+            map.addLayer({
+                'id': 'globe-newPoint',
+                'type': 'circle',
+                'source': 'newPoint',
+                'paint': {
+                    'circle-radius': [
+                        'interpolate',
+                        ['linear'],
+                        ['zoom'],
+                        0,
+                        0.25,
+                        3,
+                        4
+                    ],
+                    'circle-opacity': 1,
+                    'circle-blur': 0,
+                    'circle-color': 'red'
+                }
+            });
         }
-    });
-}
-</script>
+    </script>
 </body>
+
 </html>
